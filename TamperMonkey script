@@ -1,0 +1,2267 @@
+
+ // ==UserScript==
+ // @name         ChaosLegion - Hydra Daily Report
+ // @namespace    ChaosLegion
+ // @version      1.31
+ // @description  Chronological Hydra head reports with remaining HP, banners and Discord
+ // @match        https://www.hero-wars-alliance.com/*
+ // @run-at       document-start
+ // @sandbox      raw
+ // @grant        unsafeWindow
+ // @grant        GM_getValue
+ // @grant        GM_setValue
+ // @grant        GM_addStyle
+ // @grant        GM_xmlhttpRequest
+ // @connect      discord.com
+ // ==/UserScript==
+
+(function () {
+    'use strict';
+
+    const page = unsafeWindow;
+    const PREFIX = '🐉 ChaosLegion';
+    const WEBHOOK_KEY = 'chaosHydraDiscordWebhook';
+
+    // Same key as v1.29 and v1.30: saved banners survive upgrades.
+    const BANNER_KEY = id => `chaosHydraBanner_v129_${id}`;
+
+    const DAILY_ATTACKS = 3;
+
+    const HYDRAS = {
+        1: { name: 'Common', icon: '⬛', color: 0x53727E, file: 'common.png' },
+        2: { name: 'Elder', icon: '🟩', color: 0x4A9315, file: 'elder.png' },
+        3: { name: 'Ancient', icon: '🟦', color: 0x2448BB, file: 'ancient.png' },
+        4: { name: 'Dreadful', icon: '🟪', color: 0x8426A7, file: 'dreadful.png' },
+        5: { name: 'Legendary', icon: '🟨', color: 0xD4A017, file: 'legendary.png' }
+    };
+
+    const HEADS = [
+        { name: 'Wind', icon: '💨' },
+        { name: 'Water', icon: '🌊' },
+        { name: 'Earth', icon: '🌳' },
+        { name: 'Light', icon: '✨' },
+        { name: 'Darkness', icon: '🌀' },
+        { name: 'Fire', icon: '🔥' }
+    ];
+
+    // Overview order requested by user.
+    const HP_OVERVIEW_ORDER = [
+    4, // Darkness
+    1, // Water
+    2, // Earth
+    5, // Fire
+    0, // Wind
+    3  // Light
+];
+
+const INITIAL_HEAD_HP = {
+    1: 5946906,    // Common
+    2: 17699730,   // Elder
+    3: 54533157,   // Ancient
+    4: 106981939,  // Dreadful
+    5: 220606896   // Legendary
+};
+
+if (page.__chaosHydraObserverInstalled) {
+    console.warn(PREFIX, 'Observer already installed.');
+    return;
+}
+
+    page.__chaosHydraObserverInstalled = true;
+
+    const state = {
+        roster: [],
+        journals: {},
+        day: null,
+        expectedDay: null,
+        sending: false,
+        banners: {},
+        bannerLoading: true
+    };
+
+    let panel;
+    let previewArea;
+    let statusText;
+    let coverageArea;
+    let toggleButton;
+    let webhookInput;
+    let englishButton;
+    let russianButton;
+    let bannerStatus;
+
+    const journalKey = (id, day) => `${id}_${day}`;
+    const own = (obj, key) =>
+        Object.prototype.hasOwnProperty.call(obj, key);
+
+    const sleep = milliseconds =>
+        new Promise(resolve => setTimeout(resolve, milliseconds));
+
+    const hydraLabel = id =>
+        `${HYDRAS[id].icon} ${HYDRAS[id].name}`;
+
+    // --------------------------------------------------
+    // Head ID mapping
+    // --------------------------------------------------
+
+    function getHeadIndex(headId) {
+        const id = Number(headId);
+
+        if (
+            !Number.isInteger(id) ||
+            id < 1 ||
+            id > 30
+        ) {
+            return null;
+        }
+
+        return (id - 1) % 6;
+    }
+
+    function headLabel(index) {
+        if (index === null || !HEADS[index]) {
+            return 'Unknown head';
+        }
+
+        return `${HEADS[index].icon} ${HEADS[index].name}`;
+    }
+
+    // --------------------------------------------------
+    // Formatting
+    // --------------------------------------------------
+
+    function formatDate(day, language = 'en') {
+        if (!day) return 'Unknown day';
+
+        return new Date(Number(day) * 1000)
+            .toLocaleDateString(
+                language === 'ru' ? 'ru-RU' : 'en-GB',
+                {
+                    day: 'numeric',
+                    month: 'long',
+                    year: 'numeric',
+                    timeZone: 'UTC'
+                }
+            );
+    }
+
+    function formatTime(epoch) {
+        if (!Number(epoch)) {
+            return '--:--';
+        }
+
+        const date = new Date(Number(epoch) * 1000);
+
+        const hours = String(
+            date.getUTCHours()
+        ).padStart(2, '0');
+
+        const minutes = String(
+            date.getUTCMinutes()
+        ).padStart(2, '0');
+
+        return `h${hours}:m${minutes} UTC`;
+    }
+
+    function formatNumber(value) {
+        return Number(value || 0)
+            .toLocaleString('en-US');
+    }
+
+    // Use millions (kk), as requested.
+    // Example: 57000000 -> 57kk
+    //          57300000 -> 57.3kk
+    //          0        -> 0
+    //          null     -> —
+    function formatHealth(value) {
+        if (value === null || value === undefined) {
+            return '—';
+        }
+
+        const number = Number(value);
+
+        if (!Number.isFinite(number) || number < 0) {
+            return '—';
+        }
+
+        if (number === 0) {
+            return '0';
+        }
+
+        const millions = number / 1000000;
+
+        const decimals = number < 1000000 ? 6 : 2;
+
+        const rounded = Number(
+            millions.toFixed(decimals)
+        );
+
+        return `${rounded}kk`;
+    }
+
+    // --------------------------------------------------
+    // Journal day management
+    // --------------------------------------------------
+
+    function selectDay(day, reason) {
+        day = Number(day);
+
+        if (!Number.isFinite(day) || day <= 0) {
+            return false;
+        }
+
+        if (
+            state.day !== null &&
+            day < state.day
+        ) {
+            return false;
+        }
+
+        if (state.day === day) {
+            return true;
+        }
+
+        state.day = day;
+        state.journals = {};
+
+        console.info(
+            `${PREFIX} New Hydra day ${day} (${reason}); previous journals cleared.`
+        );
+
+        renderPanel();
+
+        return true;
+    }
+
+    // --------------------------------------------------
+    // RPC parsing
+    // --------------------------------------------------
+
+    function parseRequest(url, body) {
+        if (
+            !String(url).includes('/api/rpc') ||
+            typeof body !== 'string'
+        ) {
+            return null;
+        }
+
+        try {
+            const payload = JSON.parse(body);
+
+            if (!Array.isArray(payload.calls)) {
+                return null;
+            }
+
+            const relevantCalls = payload.calls
+                .map((call, index) => ({
+                    ...call,
+                    requestIndex: index
+                }))
+                .filter(call =>
+                    call.name === 'clanBoss_getDayHistory' ||
+                    call.name === 'user_getClanInfo'
+                );
+
+            return relevantCalls.length
+                ? { relevantCalls }
+                : null;
+
+        } catch {
+            return null;
+        }
+    }
+
+    function unwrap(entry) {
+        return entry?.result?.response ??
+            entry?.response ??
+            entry?.result ??
+            null;
+    }
+
+    // --------------------------------------------------
+    // Guild roster
+    // --------------------------------------------------
+
+    function captureRoster(response) {
+        const clanData = response?.clanData;
+        const clan = clanData?.clan;
+        const members = clan?.members;
+
+        if (
+            !members ||
+            typeof members !== 'object'
+        ) {
+            return;
+        }
+
+        const entries = Array.isArray(members)
+            ? members.map((member, index) => [
+                String(index),
+                member
+            ])
+            : Object.entries(members);
+
+        state.roster = entries.map(([key, member]) => ({
+            id: String(member?.id ?? key),
+            name: String(
+                member?.name ?? key
+            ).trim() || key
+        }));
+
+        const reset = Number(
+            clanData?.serverResetTime ??
+            response?.serverResetTime
+        );
+
+        if (
+            Number.isFinite(reset) &&
+            reset > 0
+        ) {
+            state.expectedDay = reset - 86400;
+
+            selectDay(
+                state.expectedDay,
+                'game server reset'
+            );
+        }
+
+        console.info(
+            `${PREFIX} Roster: ${state.roster.length}; expected day: ${state.expectedDay ?? 'unknown'}`
+        );
+
+        renderPanel();
+    }
+
+    // --------------------------------------------------
+    // Hydra journal capture
+    // --------------------------------------------------
+
+    function raidFlag(value) {
+        return value === true ||
+            value === 1 ||
+            value === '1' ||
+            value === 'true';
+    }
+
+    function captureJournal(response, call) {
+        if (
+            !response?.battles ||
+            typeof response.battles !== 'object'
+        ) {
+            return;
+        }
+
+        const id = Number(call.args?.hydraId);
+        const day = Number(call.args?.day);
+
+        if (
+            !own(HYDRAS, id) ||
+            !Number.isFinite(day) ||
+            day <= 0
+        ) {
+            return;
+        }
+
+        if (
+            state.expectedDay !== null &&
+            day < state.expectedDay
+        ) {
+            return;
+        }
+
+        if (!selectDay(day, `Hydra ${id} journal`)) {
+            return;
+        }
+
+        const users = response.users || {};
+        const battles = {};
+
+        for (
+            const [battleId, battle]
+            of Object.entries(response.battles)
+        ) {
+            const userId = String(
+                battle.userId ?? ''
+            );
+
+            const user = users[userId] || {};
+
+            // Preserve hpLeft! It is the health remaining
+            // immediately after this recorded attack.
+            const rawHp = battle.hpLeft;
+
+            const hpLeft = (
+                rawHp !== null &&
+                rawHp !== undefined &&
+                rawHp !== '' &&
+                Number.isFinite(Number(rawHp))
+            )
+                ? Number(rawHp)
+                : null;
+
+            battles[battleId] = {
+                battleId,
+                userId,
+                player: String(
+                    user.name ?? userId ?? 'Unknown'
+                ).trim(),
+
+                headId: String(
+                    battle.headId ?? '?'
+                ),
+
+                damage: Number(
+                    battle.damage || 0
+                ),
+
+                hpLeft,
+
+                raided: raidFlag(
+                    battle.raided
+                ),
+
+                startTime: Number(
+                    battle.startTime || 0
+                )
+            };
+        }
+
+        state.journals[journalKey(id, day)] = {
+            id,
+            day,
+            battles,
+            capturedAt: Date.now()
+        };
+
+        console.info(
+            `${PREFIX} Captured ${HYDRAS[id].name}: ${Object.keys(battles).length} attacks`
+        );
+
+        renderPanel();
+    }
+
+    // --------------------------------------------------
+    // RPC response handling
+    // --------------------------------------------------
+
+    function processResponse(data, info) {
+        if (!Array.isArray(data?.results)) {
+            return;
+        }
+
+        for (const call of info.relevantCalls) {
+            const entry = (
+                call.ident !== undefined
+                    ? data.results.find(
+                        result =>
+                            result.ident === call.ident
+                    )
+                    : null
+            ) ?? data.results[call.requestIndex];
+
+            if (!entry) continue;
+
+            if (
+                entry.error ||
+                entry.result?.error
+            ) {
+                console.warn(
+                    PREFIX,
+                    'Game RPC error:',
+                    call.name,
+                    entry.error || entry.result.error
+                );
+
+                continue;
+            }
+
+            const response = unwrap(entry);
+
+            if (call.name === 'user_getClanInfo') {
+                captureRoster(response);
+            }
+
+            if (call.name === 'clanBoss_getDayHistory') {
+                captureJournal(response, call);
+            }
+        }
+    }
+
+    // --------------------------------------------------
+    // Fetch observer
+    // --------------------------------------------------
+
+    async function getFetchBody(input, options) {
+        const body = options?.body;
+
+        if (typeof body === 'string') {
+            return body;
+        }
+
+        if (
+            body &&
+            typeof body.text === 'function'
+        ) {
+            return body.text();
+        }
+
+        if (
+            body &&
+            Object.prototype.toString.call(body) ===
+                '[object URLSearchParams]'
+        ) {
+            return body.toString();
+        }
+
+        if (
+            input &&
+            typeof input.clone === 'function' &&
+            typeof input.text === 'function'
+        ) {
+            return input.clone().text();
+        }
+
+        return '';
+    }
+
+    function createFetchWrapper(originalFetch) {
+        if (
+            typeof originalFetch !== 'function' ||
+            originalFetch.__chaosHydraWrapped
+        ) {
+            return originalFetch;
+        }
+
+        function wrappedFetch(...args) {
+            const [input, options = {}] = args;
+
+            const url = (
+                input &&
+                typeof input.url === 'string'
+            )
+                ? input.url
+                : String(input);
+
+            let bodyPromise;
+
+            try {
+                bodyPromise = Promise.resolve(
+                    getFetchBody(input, options)
+                );
+            } catch {
+                bodyPromise = Promise.resolve('');
+            }
+
+            // Authentic game request is not modified.
+            const result = Reflect.apply(
+                originalFetch,
+                this,
+                args
+            );
+
+            return Promise.resolve(result).then(
+                response => {
+                    bodyPromise.then(body => {
+                        const info = parseRequest(
+                            url,
+                            body
+                        );
+
+                        if (!info) return;
+
+                        response.clone().json()
+                            .then(data =>
+                                processResponse(data, info)
+                            )
+                            .catch(error =>
+                                console.warn(
+                                    PREFIX,
+                                    'Fetch response parse error:',
+                                    error
+                                )
+                            );
+                    }).catch(error =>
+                        console.warn(
+                            PREFIX,
+                            'Fetch request parse error:',
+                            error
+                        )
+                    );
+
+                    return response;
+                }
+            );
+        }
+
+        Object.defineProperty(
+            wrappedFetch,
+            '__chaosHydraWrapped',
+            { value: true }
+        );
+
+        return wrappedFetch;
+    }
+
+    function installFetchObserver() {
+        let wrapped = createFetchWrapper(
+            page.fetch
+        );
+
+        if (typeof wrapped !== 'function') {
+            return;
+        }
+
+        try {
+            const descriptor =
+                Object.getOwnPropertyDescriptor(
+                    page,
+                    'fetch'
+                );
+
+            Object.defineProperty(page, 'fetch', {
+                configurable: true,
+
+                enumerable:
+                    descriptor?.enumerable ?? true,
+
+                get() {
+                    return wrapped;
+                },
+
+                set(fn) {
+                    wrapped = createFetchWrapper(fn);
+
+                    console.info(
+                        PREFIX,
+                        'Fetch replacement wrapped.'
+                    );
+                }
+            });
+
+            console.info(
+                PREFIX,
+                'Fetch observer installed.'
+            );
+
+        } catch (error) {
+            console.warn(
+                PREFIX,
+                'Fetch setter failed:',
+                error
+            );
+
+            try {
+                page.fetch = wrapped;
+            } catch {
+                // XHR fallback remains available.
+            }
+        }
+    }
+
+    // --------------------------------------------------
+    // XMLHttpRequest observer
+    // --------------------------------------------------
+
+    function installXhrObserver() {
+        const proto =
+            page.XMLHttpRequest?.prototype;
+
+        if (
+            !proto ||
+            proto.__chaosHydraWrapped
+        ) {
+            return;
+        }
+
+        const originalOpen = proto.open;
+        const originalSend = proto.send;
+
+        const requests = new WeakMap();
+
+        proto.open = function (
+            method,
+            url,
+            ...args
+        ) {
+            requests.set(this, String(url));
+
+            return originalOpen.call(
+                this,
+                method,
+                url,
+                ...args
+            );
+        };
+
+        proto.send = function (body) {
+            const info = parseRequest(
+                requests.get(this),
+                body
+            );
+
+            if (info) {
+                this.addEventListener(
+                    'load',
+                    () => {
+                        try {
+                            const data =
+                                this.responseType === 'json'
+                                    ? this.response
+                                    : JSON.parse(
+                                        this.responseText
+                                    );
+
+                            processResponse(
+                                data,
+                                info
+                            );
+
+                        } catch (error) {
+                            console.warn(
+                                PREFIX,
+                                'XHR response parse error:',
+                                error
+                            );
+                        }
+                    }
+                );
+            }
+
+            return originalSend.call(
+                this,
+                body
+            );
+        };
+
+        Object.defineProperty(
+            proto,
+            '__chaosHydraWrapped',
+            { value: true }
+        );
+
+        console.info(
+            PREFIX,
+            'XHR observer installed.'
+        );
+    }
+
+    installFetchObserver();
+    installXhrObserver();
+
+    // --------------------------------------------------
+    // Journal access
+    // --------------------------------------------------
+
+    function journalFor(id) {
+        if (state.day === null) {
+            return null;
+        }
+
+        return state.journals[
+            journalKey(id, state.day)
+        ] || null;
+    }
+
+    function missingHydras() {
+        return [1, 2, 3, 4, 5]
+            .filter(id => !journalFor(id));
+    }
+
+    function isComplete() {
+        return (
+            state.day !== null &&
+            state.expectedDay === state.day &&
+            state.roster.length > 0 &&
+            missingHydras().length === 0
+        );
+    }
+
+    function allAttacks() {
+        return [1, 2, 3, 4, 5]
+            .flatMap(id => {
+                const journal = journalFor(id);
+
+                return journal
+                    ? Object.values(
+                        journal.battles
+                    ).map(attack => ({
+                        ...attack,
+                        hydraId: id
+                    }))
+                    : [];
+            });
+    }
+
+    // --------------------------------------------------
+    // Chronological ordering and remaining HP
+    // --------------------------------------------------
+
+    function compareAttacksChronologically(a, b) {
+        return (
+            a.startTime - b.startTime ||
+            a.battleId.localeCompare(b.battleId)
+        );
+    }
+
+    function headAttacks(journal, headIndex) {
+        if (!journal) return [];
+
+        return Object.values(journal.battles)
+            .filter(
+                attack =>
+                    getHeadIndex(attack.headId) === headIndex
+            )
+            .sort(compareAttacksChronologically);
+    }
+
+    function getRemainingHeadHp(journal, headIndex) {
+    const attacks = headAttacks(
+        journal,
+        headIndex
+    );
+
+    if (!attacks.length) {
+        return INITIAL_HEAD_HP[journal.id] ?? null;
+    }
+
+    const newestTime = attacks[
+        attacks.length - 1
+    ].startTime;
+
+        const newestAttacks = attacks.filter(
+            attack =>
+                attack.startTime === newestTime
+        );
+
+        // If timestamp resolution causes several attacks
+        // to have the same startTime, head health should
+        // not increase between successful attacks.
+        // Use the lowest reported remaining HP
+        // from that timestamp.
+        const values = newestAttacks
+            .map(attack => attack.hpLeft)
+            .filter(value =>
+                value !== null &&
+                Number.isFinite(value)
+            );
+
+        if (!values.length) {
+            return null;
+        }
+
+        return Math.min(...values);
+    }
+
+    function hydraHealthOverview(id) {
+        const journal = journalFor(id);
+
+        if (!journal) {
+            return null;
+        }
+
+        return HP_OVERVIEW_ORDER.map(index => {
+            const name = HEADS[index].name;
+
+            const hp = getRemainingHeadHp(
+                journal,
+                index
+            );
+
+            return `${name}: ${formatHealth(hp)}`;
+        }).join(' | ');
+    }
+
+    // --------------------------------------------------
+    // Guild member summary (unchanged layout)
+    // --------------------------------------------------
+
+    function playerSummary(attacks) {
+        const byUser = new Map();
+
+        for (const attack of attacks) {
+            if (!byUser.has(attack.userId)) {
+                byUser.set(attack.userId, []);
+            }
+
+            byUser.get(
+                attack.userId
+            ).push(attack);
+        }
+
+        return [...state.roster]
+            .sort((a, b) =>
+                a.name.localeCompare(b.name)
+            )
+            .map(member => {
+                const memberAttacks =
+                    byUser.get(member.id) || [];
+
+                memberAttacks.sort(
+                    compareAttacksChronologically
+                );
+
+                return {
+                    ...member,
+                    attacks: memberAttacks,
+                    count: memberAttacks.length
+                };
+            });
+    }
+
+    // --------------------------------------------------
+    // Overview report
+    // --------------------------------------------------
+
+    function buildOverview(language) {
+        const ru = language === 'ru';
+        const complete = isComplete();
+
+        const missing = missingHydras();
+        const attacks = allAttacks();
+        const players = playerSummary(attacks);
+
+        const date = formatDate(
+            state.day,
+            language
+        );
+
+        const lines = [
+            ru
+                ? `**ChaosLegion — 🐉 Гидра 🐉— ${date}**`
+                : `**ChaosLegion — 🐉 Hydra 🐉— ${date}**`,
+
+            complete
+                ? (
+                    ru
+                        ? '✅ **ПОЛНЫЙ ОТЧЁТ — 5/5 журналов и состав гильдии**'
+                        : '✅ **COMPLETE — 5/5 journals and guild roster captured**'
+                )
+                : (
+                    ru
+                        ? '⚠️ **НЕПОЛНЫЙ ОТЧЁТ — показатели предварительные**'
+                        : '⚠️ **INCOMPLETE REPORT — all counts are provisional**'
+                ),
+
+            ru
+                ? `Журналы: **${5 - missing.length}/5** | Участники: **${state.roster.length}** | Атаки: **${attacks.length}**`
+                : `Journals: **${5 - missing.length}/5** | Roster: **${state.roster.length}** | Recorded attacks: **${attacks.length}**`
+        ];
+
+        if (missing.length) {
+            lines.push(
+                (ru ? 'Не получены: ' : 'Missing: ') +
+                missing.map(
+                    id => hydraLabel(id)
+                ).join(', ')
+            );
+        }
+
+        if (state.expectedDay === null) {
+            lines.push(
+                ru
+                    ? '⚠️ День не подтверждён временем сброса сервера.'
+                    : '⚠️ Day not verified against the game server reset.'
+            );
+        }
+
+        if (!state.roster.length) {
+            lines.push(
+                ru
+                    ? '⚠️ Состав гильдии не получен.'
+                    : '⚠️ Guild roster missing: members with zero attacks are unknown.'
+            );
+        }
+
+        if (players.length) {
+            const used = players.filter(
+                player =>
+                    player.count >= DAILY_ATTACKS
+            ).length;
+
+            const partial = players.filter(
+                player =>
+                    player.count > 0 &&
+                    player.count < DAILY_ATTACKS
+            ).length;
+
+            const none = players.filter(
+                player =>
+                    player.count === 0
+            ).length;
+
+            lines.push(
+                ru
+                    ? `3+ атак: **${used}** | 1–2: **${partial}** | 0 записей: **${none}**`
+                    : `3+ recorded: **${used}** | 1–2 recorded: **${partial}** | 0 recorded: **${none}**`
+            );
+
+            lines.push('');
+
+            lines.push(
+                ru
+                    ? '**Участники гильдии**'
+                    : '**Guild members**'
+            );
+
+            for (const player of players) {
+                const symbol =
+                    player.count >= DAILY_ATTACKS
+                        ? '✅'
+                        : !complete
+                            ? '❔'
+                            : player.count > 0
+                                ? '🟡'
+                                : '❌';
+
+                const count = complete
+                    ? `${player.count}/3`
+                    : `≥${player.count}/3`;
+
+                const extra =
+                    player.count > 3
+                        ? ` (+${player.count - 3} ${ru ? 'доп.' : 'extra'})`
+                        : '';
+
+                lines.push(
+                    `${symbol} **${player.name}** — ${count}${extra}`
+                );
+            }
+        }
+
+        if (!complete) {
+            lines.push('');
+
+            lines.push(
+                ru
+                    ? '⚠️ При неполных журналах оставшиеся атаки неизвестны.'
+                    : '⚠️ With missing journals, recorded attacks do not establish remaining horns.'
+            );
+        }
+
+        return lines.join('\n');
+    }
+
+    // --------------------------------------------------
+    // Hydra report grouped by head
+    // --------------------------------------------------
+
+    function hydraLines(
+        id,
+        language,
+        includeHeading = false
+    ) {
+        const ru = language === 'ru';
+        const journal = journalFor(id);
+
+        const lines = [];
+
+        if (includeHeading) {
+            lines.push(
+                `**${hydraLabel(id)}**`
+            );
+        }
+
+        if (!journal) {
+            lines.push(
+                ru
+                    ? '**ЖУРНАЛ НЕ ПОЛУЧЕН**'
+                    : '**JOURNAL NOT CAPTURED**'
+            );
+
+            return lines;
+        }
+
+        const records = Object.values(
+            journal.battles
+        );
+
+        // NEW: Six-head HP overview.
+        // This appears directly below the image in Discord.
+        const hpOverview = hydraHealthOverview(id);
+
+        lines.push(
+            `**${hpOverview}**`
+        );
+
+        // NEW: Empty line before attack count.
+        lines.push('');
+
+        lines.push(
+            `**${records.length} ${ru ? 'атак' : 'attacks'}**`
+        );
+
+        if (!records.length) {
+            lines.push('');
+
+            lines.push(
+                ru
+                    ? '_0 атак (журнал получен)_'
+                    : '_0 attacks (journal captured)_'
+            );
+
+            return lines;
+        }
+
+        const names = new Map(
+            state.roster.map(member => [
+                member.id,
+                member.name
+            ])
+        );
+
+        const groups = new Map();
+
+        // Group attacks by element.
+        for (const attack of records) {
+            const index = getHeadIndex(
+                attack.headId
+            );
+
+            const key = index === null
+                ? `unknown:${attack.headId}`
+                : index;
+
+            if (!groups.has(key)) {
+                groups.set(key, []);
+            }
+
+            groups.get(key).push(attack);
+        }
+
+        // Wind, Water, Earth, Light, Darkness, Fire.
+        // Unknown head IDs are kept, not discarded.
+        const orderedKeys = [
+            0, 1, 2, 3, 4, 5,
+            ...[...groups.keys()]
+                .filter(
+                    key =>
+                        typeof key !== 'number'
+                )
+                .sort()
+        ];
+
+        for (const key of orderedKeys) {
+            const group = groups.get(key);
+
+            if (!group?.length) {
+                continue;
+            }
+
+            const label =
+                typeof key === 'number'
+                    ? headLabel(key)
+                    : `Head ${key.slice('unknown:'.length)}`;
+
+            lines.push('');
+
+            lines.push(
+                `**${label} — ${group.length} ${ru ? 'атак' : 'attacks'}**`
+            );
+
+            // NEW: Sort by attack timestamp,
+            // earliest attack first.
+            group.sort(
+                compareAttacksChronologically
+            );
+
+            for (const attack of group) {
+                const playerName =
+                    names.get(attack.userId) ||
+                    attack.player;
+
+                const raidMarker =
+                    attack.raided
+                        ? ' 🔁 RAID'
+                        : '';
+
+                lines.push(
+                    `• **${playerName}** — ` +
+                    `${formatNumber(attack.damage)} — ` +
+                    `${formatTime(attack.startTime)}` +
+                    raidMarker
+                );
+            }
+
+            // NEW: Remaining HP after the last attack
+            // recorded against this specific head.
+            if (typeof key === 'number') {
+                const hp = getRemainingHeadHp(
+                    journal,
+                    key
+                );
+
+                lines.push('');
+
+                lines.push(
+                    ru
+                        ? `**Осталось HP: ${formatHealth(hp)}**`
+                        : `**Remaining HP: ${formatHealth(hp)}**`
+                );
+            } else {
+                const chronological =
+                    [...group].sort(
+                        compareAttacksChronologically
+                    );
+
+                const last = chronological[
+                    chronological.length - 1
+                ];
+
+                lines.push('');
+
+                lines.push(
+                    ru
+                        ? `**Осталось HP: ${formatHealth(last.hpLeft)}**`
+                        : `**Remaining HP: ${formatHealth(last.hpLeft)}**`
+                );
+            }
+        }
+
+        return lines;
+    }
+
+    function buildReport(language = 'en') {
+        return [
+            buildOverview(language),
+
+            ...[1, 2, 3, 4, 5].map(
+                id =>
+                    hydraLines(
+                        id,
+                        language,
+                        true
+                    ).join('\n')
+            )
+        ].join('\n\n');
+    }
+
+    // --------------------------------------------------
+    // Discord chunking
+    // --------------------------------------------------
+
+    function chunkText(text, max = 3800) {
+        const chunks = [];
+        let current = '';
+
+        for (
+            const sourceLine of text.split('\n')
+        ) {
+            let line = sourceLine;
+
+            while (line.length > max) {
+                if (current) {
+                    chunks.push(current);
+                    current = '';
+                }
+
+                chunks.push(
+                    line.slice(0, max)
+                );
+
+                line = line.slice(max);
+            }
+
+            const next = current
+                ? `${current}\n${line}`
+                : line;
+
+            if (next.length > max) {
+                chunks.push(current);
+                current = line;
+            } else {
+                current = next;
+            }
+        }
+
+        if (current) {
+            chunks.push(current);
+        }
+
+        return chunks;
+    }
+
+    // --------------------------------------------------
+    // Banner storage
+    // --------------------------------------------------
+
+    function bannerCount() {
+        return [1, 2, 3, 4, 5]
+            .filter(id => !!state.banners[id])
+            .length;
+    }
+
+    function renderBannerStatus() {
+        if (!bannerStatus) {
+            return;
+        }
+
+        bannerStatus.textContent =
+            state.bannerLoading
+                ? 'Loading saved banners...'
+                : `Original banners saved: ${bannerCount()}/5 (` +
+                    [1, 2, 3, 4, 5].map(id =>
+                        `${state.banners[id] ? '✅' : '⬜'} ${HYDRAS[id].name}`
+                    ).join(' · ') +
+                    ')';
+    }
+
+    async function loadSavedBanners() {
+        for (const id of [1, 2, 3, 4, 5]) {
+            try {
+                state.banners[id] =
+                    await GM_getValue(
+                        BANNER_KEY(id),
+                        ''
+                    );
+            } catch (error) {
+                console.warn(
+                    PREFIX,
+                    `Could not load ${HYDRAS[id].name} banner`,
+                    error
+                );
+            }
+        }
+
+        state.bannerLoading = false;
+        renderBannerStatus();
+    }
+
+    function readFileAsDataUrl(file) {
+        return new Promise(
+            (resolve, reject) => {
+                const reader = new FileReader();
+
+                reader.onload = () =>
+                    resolve(
+                        String(reader.result)
+                    );
+
+                reader.onerror = () =>
+                    reject(
+                        new Error(
+                            `Cannot read ${file.name}`
+                        )
+                    );
+
+                reader.readAsDataURL(file);
+            }
+        );
+    }
+
+    async function importBanners(files) {
+        let imported = 0;
+
+        for (const file of files) {
+            const name =
+                file.name.toLowerCase();
+
+            const id = [1, 2, 3, 4, 5]
+                .find(
+                    n =>
+                        name === HYDRAS[n].file
+                );
+
+            if (!id) {
+                console.warn(
+                    PREFIX,
+                    'Skipped unrecognized filename:',
+                    file.name
+                );
+
+                continue;
+            }
+
+            if (file.type !== 'image/png') {
+                console.warn(
+                    PREFIX,
+                    'Expected PNG:',
+                    file.name
+                );
+
+                continue;
+            }
+
+            if (file.size > 2 * 1024 * 1024) {
+                console.warn(
+                    PREFIX,
+                    'Image exceeds 2 MB:',
+                    file.name
+                );
+
+                continue;
+            }
+
+            const url =
+                await readFileAsDataUrl(file);
+
+            await GM_setValue(
+                BANNER_KEY(id),
+                url
+            );
+
+            state.banners[id] = url;
+
+            imported++;
+        }
+
+        renderBannerStatus();
+
+        if (statusText) {
+            statusText.textContent =
+                `Imported ${imported} banner(s). Saved ${bannerCount()}/5.`;
+        }
+    }
+
+    function imageBlob(dataUrl) {
+        const match =
+            /^data:(image\/(?:png|jpeg|webp));base64,(.+)$/s
+                .exec(dataUrl || '');
+
+        if (!match) {
+            throw new Error(
+                'Saved banner is not a supported image data URL.'
+            );
+        }
+
+        const binary = atob(match[2]);
+
+        const bytes =
+            new Uint8Array(binary.length);
+
+        for (
+            let i = 0;
+            i < binary.length;
+            i++
+        ) {
+            bytes[i] =
+                binary.charCodeAt(i);
+        }
+
+        return new Blob(
+            [bytes],
+            { type: match[1] }
+        );
+    }
+
+    // --------------------------------------------------
+    // Discord webhook requests
+    // --------------------------------------------------
+
+    function sendRequest(
+        webhook,
+        payload,
+        bannerId = null
+    ) {
+        return new Promise(
+            (resolve, reject) => {
+                const details = {
+                    method: 'POST',
+                    url: webhook,
+                    timeout: 30000,
+
+                    onload: resolve,
+
+                    onerror: () =>
+                        reject(
+                            new Error(
+                                'Discord network error'
+                            )
+                        ),
+
+                    ontimeout: () =>
+                        reject(
+                            new Error(
+                                'Discord request timed out'
+                            )
+                        )
+                };
+
+                if (bannerId !== null) {
+                    const filename =
+                        HYDRAS[bannerId].file;
+
+                    const form =
+                        new FormData();
+
+                    form.append(
+                        'payload_json',
+                        JSON.stringify({
+                            ...payload,
+                            attachments: [{
+                                id: 0,
+                                filename
+                            }]
+                        })
+                    );
+
+                    form.append(
+                        'files[0]',
+                        imageBlob(
+                            state.banners[bannerId]
+                        ),
+                        filename
+                    );
+
+                    details.data = form;
+
+                    // FormData supplies the multipart
+                    // Content-Type boundary itself.
+                } else {
+                    details.headers = {
+                        'Content-Type':
+                            'application/json'
+                    };
+
+                    details.data =
+                        JSON.stringify(payload);
+                }
+
+                GM_xmlhttpRequest(details);
+            }
+        );
+    }
+
+    async function discordPost(
+        webhook,
+        embeds,
+        bannerId = null
+    ) {
+        const payload = {
+            embeds,
+            allowed_mentions: {
+                parse: []
+            }
+        };
+
+        for (
+            let attempt = 0;
+            attempt < 4;
+            attempt++
+        ) {
+            const result = await sendRequest(
+                webhook,
+                payload,
+                bannerId
+            );
+
+            if (
+                result.status >= 200 &&
+                result.status < 300
+            ) {
+                return;
+            }
+
+            if (
+                result.status === 429 &&
+                attempt < 3
+            ) {
+                let seconds = 2;
+
+                try {
+                    const data = JSON.parse(
+                        result.responseText || '{}'
+                    );
+
+                    seconds = Math.max(
+                        0.5,
+                        Number(data.retry_after) || 2
+                    );
+                } catch {
+                    // Default retry delay.
+                }
+
+                await sleep(
+                    Math.min(
+                        seconds * 1000 + 300,
+                        30000
+                    )
+                );
+
+                continue;
+            }
+
+            throw new Error(
+                `Discord HTTP ${result.status}: ` +
+                (result.responseText || '')
+                    .slice(0, 300)
+            );
+        }
+    }
+
+    // --------------------------------------------------
+    // Send English / Russian reports
+    // --------------------------------------------------
+
+    async function sendLanguage(language) {
+        if (state.sending) {
+            return;
+        }
+
+        const webhook =
+            webhookInput.value.trim();
+
+        if (
+            !/^https:\/\/discord\.com\/api\/webhooks\/\d+\/[^\s/]+(?:\?[^\s]+)?$/
+                .test(webhook)
+        ) {
+            alert(
+                'Please enter a valid Discord webhook URL.'
+            );
+
+            return;
+        }
+
+        if (!state.day) {
+            alert(
+                'No Hydra journal data yet. Open a journal first.'
+            );
+
+            return;
+        }
+
+        if (!state.roster.length) {
+            alert(
+                'Guild roster is missing. Wait for user_getClanInfo before sending.'
+            );
+
+            return;
+        }
+
+        if (state.bannerLoading) {
+            alert(
+                'Banner images are still loading.'
+            );
+
+            return;
+        }
+
+        const missing = missingHydras();
+
+        if (
+            missing.length &&
+            !page.confirm(
+                `Incomplete journals: ${missing.map(id => HYDRAS[id].name).join(', ')}.\n\n` +
+                'Send a PROVISIONAL report anyway?'
+            )
+        ) {
+            return;
+        }
+
+        if (
+            state.expectedDay === null &&
+            !page.confirm(
+                'Hydra day was not verified against server reset. Send anyway?'
+            )
+        ) {
+            return;
+        }
+
+        if (
+            bannerCount() < 5 &&
+            !page.confirm(
+                `Only ${bannerCount()}/5 banners are saved.\n\n` +
+                'Missing banners will use text headings. Send anyway?'
+            )
+        ) {
+            return;
+        }
+
+        state.sending = true;
+
+        englishButton.disabled = true;
+        russianButton.disabled = true;
+
+        const ru = language === 'ru';
+
+        const overview =
+            buildOverview(language);
+
+        const sections =
+            [1, 2, 3, 4, 5].map(id => ({
+                id,
+
+                chunks: chunkText(
+                    hydraLines(
+                        id,
+                        language,
+                        !state.banners[id]
+                    ).join('\n')
+                )
+            }));
+
+        const title = (
+            ru
+                ? 'ChaosLegion — 🐉 Гидра 🐉'
+                : 'ChaosLegion — 🐉 Hydra 🐉'
+        ) + `— ${formatDate(state.day, language)}`;
+
+        try {
+            await GM_setValue(
+                WEBHOOK_KEY,
+                webhook
+            );
+
+            const introChunks =
+                chunkText(overview);
+
+            for (
+                let index = 0;
+                index < introChunks.length;
+                index++
+            ) {
+                statusText.textContent =
+                    `Sending overview ${index + 1}/${introChunks.length}...`;
+
+                await discordPost(
+                    webhook,
+                    [{
+                        title:
+                            introChunks.length > 1
+                                ? `${title} (${index + 1}/${introChunks.length})`
+                                : title,
+
+                        description:
+                            introChunks[index],
+
+                        color:
+                            ru ? 0x8E44AD : 0x3498DB
+                    }]
+                );
+
+                await sleep(900);
+            }
+
+            for (const section of sections) {
+                const id = section.id;
+
+                const bannerAvailable =
+                    !!state.banners[id];
+
+                for (
+                    let index = 0;
+                    index < section.chunks.length;
+                    index++
+                ) {
+                    statusText.textContent =
+                        `Sending ${HYDRAS[id].name} (${index + 1}/${section.chunks.length})...`;
+
+                    const embeds = [];
+
+                    const attach =
+                        bannerAvailable &&
+                        index === 0;
+
+                    if (attach) {
+                        // Banner embed appears before
+                        // the head HP and attack details.
+                        embeds.push({
+                            image: {
+                                url:
+                                    `attachment://${HYDRAS[id].file}`
+                            }
+                        });
+                    }
+
+                    embeds.push({
+                        description:
+                            section.chunks[index],
+
+                        color:
+                            HYDRAS[id].color,
+
+                        ...(
+                            index > 0
+                                ? {
+                                    title:
+                                        `${HYDRAS[id].name} (${index + 1}/${section.chunks.length})`
+                                }
+                                : {}
+                        )
+                    });
+
+                    await discordPost(
+                        webhook,
+                        embeds,
+                        attach ? id : null
+                    );
+
+                    await sleep(900);
+                }
+            }
+
+            statusText.textContent =
+                'Discord report sent, including all five Hydra sections.';
+
+        } catch (error) {
+            console.error(
+                PREFIX,
+                'Discord send failed:',
+                error
+            );
+
+            statusText.textContent =
+                `Discord error: ${error.message}. Earlier sections may have been sent.`;
+
+        } finally {
+            state.sending = false;
+
+            englishButton.disabled = false;
+            russianButton.disabled = false;
+        }
+    }
+
+    // --------------------------------------------------
+    // Panel rendering
+    // --------------------------------------------------
+
+    function renderPanel() {
+        if (
+            !panel ||
+            !previewArea ||
+            !coverageArea ||
+            !statusText
+        ) {
+            return;
+        }
+
+        const missing =
+            missingHydras();
+
+        const count =
+            5 - missing.length;
+
+        coverageArea.textContent =
+            [1, 2, 3, 4, 5].map(id => {
+                const journal =
+                    journalFor(id);
+
+                return journal
+                    ? `✅ ${hydraLabel(id)}: ${Object.keys(journal.battles).length} attacks captured`
+                    : `⬜ ${hydraLabel(id)}: NOT CAPTURED`;
+            }).join('\n');
+
+        statusText.textContent =
+            `${isComplete() ? 'COMPLETE' : 'INCOMPLETE'} | ` +
+            `Day: ${formatDate(state.day)} | ` +
+            `Roster: ${state.roster.length} | ` +
+            `Journals: ${count}/5 | ` +
+            `Attacks: ${allAttacks().length}`;
+
+        previewArea.value =
+            state.day
+                ? buildReport('en')
+                : (
+                    'No Hydra journal data yet. ' +
+                    'Minimize this panel and manually open each of the five Hydra journals.'
+                );
+
+        if (toggleButton) {
+            toggleButton.textContent =
+                `Hydra Report ${count}/5`;
+        }
+    }
+
+    // --------------------------------------------------
+    // Floating panel CSS
+    // --------------------------------------------------
+
+    function addStyles() {
+        GM_addStyle(`
+            #chaos-hydra-report-panel {
+                position: fixed !important;
+                top: 50% !important;
+                left: 50% !important;
+                transform: translate(-50%, -50%) !important;
+                width: min(850px, 90vw) !important;
+                max-height: 85vh !important;
+                overflow-y: auto !important;
+                z-index: 2147483647 !important;
+                background: #20232b !important;
+                color: white !important;
+                border: 1px solid #555 !important;
+                border-radius: 10px !important;
+                padding: 16px !important;
+                box-sizing: border-box !important;
+                box-shadow: 0 8px 30px rgba(0,0,0,.6) !important;
+                font: 14px Arial, sans-serif !important;
+            }
+
+            #chaos-hydra-report-panel * {
+                box-sizing: border-box !important;
+            }
+
+            #chaos-hydra-report-panel input[type="password"],
+            #chaos-hydra-report-panel textarea {
+                display: block !important;
+                width: 100% !important;
+                padding: 8px !important;
+                margin: 6px 0 12px !important;
+                background: #30343d !important;
+                color: white !important;
+                border: 1px solid #666 !important;
+                border-radius: 5px !important;
+            }
+
+            #chaos-hydra-report-panel textarea {
+                min-height: 260px !important;
+                resize: vertical !important;
+            }
+
+            #chaos-hydra-report-panel button,
+            #chaos-hydra-toggle {
+                padding: 8px 12px !important;
+                margin: 4px !important;
+                cursor: pointer !important;
+                border: 1px solid #777 !important;
+                border-radius: 5px !important;
+                background: #414957 !important;
+                color: white !important;
+            }
+
+            #chaos-hydra-report-panel button:hover,
+            #chaos-hydra-toggle:hover {
+                background: #596579 !important;
+            }
+
+            #chaos-hydra-report-panel button:disabled {
+                opacity: .5 !important;
+                cursor: wait !important;
+            }
+
+            #chaos-hydra-toggle {
+                position: fixed !important;
+                right: 20px !important;
+                bottom: 20px !important;
+                z-index: 2147483647 !important;
+            }
+
+            #chaos-hydra-report-panel .hydra-header {
+                display: flex !important;
+                justify-content: space-between !important;
+                align-items: center !important;
+            }
+
+            #chaos-hydra-report-panel .hydra-coverage {
+                white-space: pre-line !important;
+                background: #2a2e37 !important;
+                padding: 10px !important;
+                margin: 10px 0 !important;
+                line-height: 1.6 !important;
+                border-radius: 5px !important;
+            }
+
+            #chaos-hydra-report-panel .hydra-status {
+                color: #cbd5e1 !important;
+                margin: 10px 0 !important;
+            }
+
+            #chaos-hydra-report-panel .hydra-help {
+                color: #d3dce7 !important;
+                line-height: 1.5 !important;
+                margin: 8px 0 !important;
+            }
+
+            #chaos-hydra-report-panel .hydra-file {
+                display: block !important;
+                margin: 8px 0 !important;
+                max-width: 100% !important;
+            }
+        `);
+    }
+
+    // --------------------------------------------------
+    // UI helpers
+    // --------------------------------------------------
+
+    function makeButton(text, handler) {
+        const button =
+            document.createElement('button');
+
+        button.type = 'button';
+        button.textContent = text;
+
+        button.addEventListener(
+            'click',
+            handler
+        );
+
+        return button;
+    }
+
+    // --------------------------------------------------
+    // Create floating panel
+    // --------------------------------------------------
+
+    function createPanel() {
+        if (
+            document.getElementById(
+                'chaos-hydra-report-panel'
+            )
+        ) {
+            return;
+        }
+
+        addStyles();
+
+        panel =
+            document.createElement('section');
+
+        panel.id =
+            'chaos-hydra-report-panel';
+
+        const header =
+            document.createElement('div');
+
+        header.className =
+            'hydra-header';
+
+        const heading =
+            document.createElement('strong');
+
+        heading.textContent =
+            'ChaosLegion — Hydra Daily Report v1.31';
+
+        const minimize =
+            makeButton(
+                'Minimize',
+                () => {
+                    panel.style.display =
+                        'none';
+
+                    toggleButton.style.display =
+                        'block';
+                }
+            );
+
+        header.append(
+            heading,
+            minimize
+        );
+
+        panel.append(header);
+
+        // Webhook
+        const webhookLabel =
+            document.createElement('label');
+
+        webhookLabel.textContent =
+            'Discord webhook URL';
+
+        webhookInput =
+            document.createElement('input');
+
+        webhookInput.type = 'password';
+
+        webhookInput.placeholder =
+            'Paste Discord webhook URL';
+
+        webhookInput.addEventListener(
+            'change',
+            () =>
+                GM_setValue(
+                    WEBHOOK_KEY,
+                    webhookInput.value.trim()
+                )
+        );
+
+        panel.append(
+            webhookLabel,
+            webhookInput
+        );
+
+        // Instructions
+        const help =
+            document.createElement('div');
+
+        help.className =
+            'hydra-help';
+
+        help.textContent =
+            'Import the five PNG banners once. Minimize this panel and manually open all five Hydra journals to collect current-day data. Attacks are grouped by head and ordered chronologically.';
+
+        panel.append(help);
+
+        // Banner import
+        const bannerHeading =
+            document.createElement('strong');
+
+        bannerHeading.textContent =
+            'Original Hydra banners (one-time setup)';
+
+        const bannerPicker =
+            document.createElement('input');
+
+        bannerPicker.type = 'file';
+
+        bannerPicker.accept =
+            '.png,image/png';
+
+        bannerPicker.multiple = true;
+
+        bannerPicker.className =
+            'hydra-file';
+
+        bannerPicker.addEventListener(
+            'change',
+            async () => {
+                try {
+                    await importBanners(
+                        Array.from(
+                            bannerPicker.files || []
+                        )
+                    );
+                } catch (error) {
+                    console.error(
+                        PREFIX,
+                        'Banner import failed:',
+                        error
+                    );
+
+                    statusText.textContent =
+                        `Banner import error: ${error.message}`;
+                }
+
+                // Keep selected filenames visible.
+                // Do not clear bannerPicker.value.
+            }
+        );
+
+        bannerStatus =
+            document.createElement('div');
+
+        bannerStatus.className =
+            'hydra-status';
+
+        panel.append(
+            bannerHeading,
+            bannerPicker,
+            bannerStatus
+        );
+
+        // Journal coverage
+        const coverageTitle =
+            document.createElement('strong');
+
+        coverageTitle.textContent =
+            'Journal coverage';
+
+        coverageArea =
+            document.createElement('div');
+
+        coverageArea.className =
+            'hydra-coverage';
+
+        statusText =
+            document.createElement('div');
+
+        statusText.className =
+            'hydra-status';
+
+        panel.append(
+            coverageTitle,
+            coverageArea,
+            statusText
+        );
+
+        // Text preview
+        const previewLabel =
+            document.createElement('label');
+
+        previewLabel.textContent =
+            'Text preview (original Hydra banners appear in Discord)';
+
+        previewArea =
+            document.createElement('textarea');
+
+        previewArea.readOnly = true;
+
+        panel.append(
+            previewLabel,
+            previewArea
+        );
+
+        // Discord buttons
+        englishButton =
+            makeButton(
+                'Send English to Discord',
+                () => sendLanguage('en')
+            );
+
+        russianButton =
+            makeButton(
+                'Send Russian to Discord',
+                () => sendLanguage('ru')
+            );
+
+        const actions =
+            document.createElement('div');
+
+        actions.append(
+            englishButton,
+            russianButton
+        );
+
+        panel.append(actions);
+
+        document.body.append(panel);
+
+        // Minimized toggle
+        toggleButton =
+            makeButton(
+                'Hydra Report 0/5',
+                () => {
+                    panel.style.display =
+                        'block';
+
+                    toggleButton.style.display =
+                        'none';
+                }
+            );
+
+        toggleButton.id =
+            'chaos-hydra-toggle';
+
+        toggleButton.style.display =
+            'none';
+
+        document.body.append(
+            toggleButton
+        );
+
+        // Restore saved webhook
+        Promise.resolve(
+            GM_getValue(WEBHOOK_KEY, '')
+        ).then(value => {
+            webhookInput.value =
+                value || '';
+        }).catch(error => {
+            console.warn(
+                PREFIX,
+                'Could not restore webhook:',
+                error
+            );
+        });
+
+        // Restore saved banners
+        loadSavedBanners();
+
+        renderPanel();
+    }
+
+    // --------------------------------------------------
+    // Startup
+    // --------------------------------------------------
+
+    if (document.body) {
+        createPanel();
+    } else {
+        document.addEventListener(
+            'DOMContentLoaded',
+            createPanel,
+            { once: true }
+        );
+    }
+
+    console.info(
+        `${PREFIX} Hydra Daily Report v1.31 installed.`
+    );
+})();
