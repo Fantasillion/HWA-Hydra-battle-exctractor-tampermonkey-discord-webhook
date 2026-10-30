@@ -6,7 +6,7 @@ Extract hydra battle info at export it manually via text or via webhook to disco
 
 Instructions:
 1. Install TamperMonkey in your preferred browser https://www.tampermonkey.net/
-2. Copy the contents of "[[TamperMonkey script]]([url](https://github.com/Fantasillion/HWA-Hydra-battle-exctractor-tampermonkey-discord-webhook/blob/main/TamperMonkey%20script))" in to a new script.
+2. Copy the contents of "[TamperMonkey script]https://github.com/Fantasillion/HWA-Hydra-battle-exctractor-tampermonkey-discord-webhook/blob/main/TamperMonkey%20script)" in to a new script.
 3. ~If you want to webhook in to a Discord server, go the a text channel type \ and drag and drop these files one at a time and copy the upload these emojis to your discord server hydra_common.png hydra_common.png~ 
 4. Download and select these 5 hydra images from the repository in the script window: common.png, elder.png, ancient, dreadful.png, legendary.png  
 5. If you use Discord, copy the webhook url from the Discord channel you want to post data in and paste in the script window
